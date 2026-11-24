@@ -1,0 +1,5 @@
+dist
+node_modules
+amplify_outputs.json
+.amplify
+package-lock.json
