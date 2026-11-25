@@ -6,8 +6,6 @@ export const storage = defineStorage({
     'photos/{entity_id}/*': [
       allow.entity('identity').to(['read', 'write', 'delete']),
       allow.authenticated.to(['read']),
-    ],
-    'photos/*': [
       allow.groups(['Users', 'Admins']).to(['read', 'write', 'delete']),
     ],
   }),
