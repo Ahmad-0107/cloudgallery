@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Hub } from 'aws-amplify/utils';
 import { getCurrentUser, fetchAuthSession, signInWithRedirect, signOut } from 'aws-amplify/auth';
 import { generateClient } from 'aws-amplify/data';
@@ -8,21 +8,36 @@ import type { Schema } from '../amplify/data/resource';
 
 const client = generateClient<Schema>();
 type Photo = Schema['Photo']['type'] & { url?: string };
-type Me = { email?: string; groups?: string[] };
+type Me = { email?: string; groups?: string[]; sub?: string; username?: string };
+type AuthUser = { userId: string; username: string };
+
+function formatDate(iso?: string | null) {
+  if (!iso) return 'Just now';
+  return new Date(iso).toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  });
+}
 
 function Landing() {
   return (
     <div className="landing">
-      <div className="glow" />
-      <span className="pill">Serverless · AWS Amplify</span>
+      <span className="pill">
+        <span className="pill-dot" />
+        Serverless Cloud Architecture &middot; AWS Amplify Gen 2
+      </span>
       <h1>
         Your moments,
         <br />
         <span className="grad">beautifully shared.</span>
       </h1>
-      <p>A private-by-default photo gallery. Sign in once, upload in seconds, browse everything.</p>
+      <p>
+        A private-by-default cloud photo gallery powered by Amazon Cognito, S3, and AppSync. Sign
+        in once, upload in seconds, and manage your collection anywhere.
+      </p>
       <button className="btn big" onClick={() => signInWithRedirect({ provider: 'Google' })}>
-        <svg width="18" height="18" viewBox="0 0 48 48">
+        <svg width="19" height="19" viewBox="0 0 48 48">
           <path
             fill="#EA4335"
             d="M24 9.5c3.5 0 6.6 1.2 9 3.6l6.7-6.7C35.7 2.4 30.2 0 24 0 14.6 0 6.5 5.4 2.6 13.2l7.8 6C12.3 13.5 17.7 9.5 24 9.5z"
@@ -42,17 +57,66 @@ function Landing() {
         </svg>
         Continue with Google
       </button>
+
+      <div className="feature-strip">
+        <div className="feature-item">
+          <strong>Google OAuth + Cognito</strong>
+          <span>Federated identity with role-based Member and Admin access groups.</span>
+        </div>
+        <div className="feature-item">
+          <strong>Scoped Amazon S3</strong>
+          <span>Identity-isolated object prefixes with pre-signed URL delivery.</span>
+        </div>
+        <div className="feature-item">
+          <strong>AppSync &amp; DynamoDB</strong>
+          <span>Real-time GraphQL metadata persistence with owner-enforced rules.</span>
+        </div>
+      </div>
     </div>
   );
 }
 
-function Dashboard({ uid }: { uid: string }) {
+function Dashboard({ user }: { user: AuthUser }) {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [me, setMe] = useState<Me>({});
   const [busy, setBusy] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [drag, setDrag] = useState(false);
   const [open, setOpen] = useState<Photo | null>(null);
-  const isAdmin = me.groups?.includes('Admins');
+  const [filter, setFilter] = useState<'all' | 'mine'>('all');
+  const [query, setQuery] = useState('');
+  const [toast, setToast] = useState<{ text: string; err?: boolean } | null>(null);
+
+  const notify = useCallback((text: string, err = false) => {
+    setToast({ text, err });
+    setTimeout(() => setToast(null), 3400);
+  }, []);
+
+  const isAdmin = Boolean(me.groups?.includes('Admins'));
+
+  const displayRole = useMemo(() => {
+    if (isAdmin) return 'Admins';
+    const named = me.groups?.find((g) => g === 'Users' || !g.endsWith('_Google'));
+    return named ?? 'Users';
+  }, [isAdmin, me.groups]);
+
+  const ownerIds = useMemo(() => {
+    return [user.userId, user.username, me.sub, me.username].filter(
+      (v): v is string => Boolean(v),
+    );
+  }, [user.userId, user.username, me.sub, me.username]);
+
+  const isMine = useCallback(
+    (p: Photo) => {
+      if (!p.owner) return false;
+      return ownerIds.some(
+        (id) => p.owner === id || p.owner!.startsWith(`${id}::`) || p.owner!.endsWith(`::${id}`),
+      );
+    },
+    [ownerIds],
+  );
+
+  const canDelete = useCallback((p: Photo) => isAdmin || isMine(p), [isAdmin, isMine]);
 
   const load = useCallback(async () => {
     const { data } = await client.models.Photo.list();
@@ -65,43 +129,96 @@ function Dashboard({ uid }: { uid: string }) {
   }, []);
 
   useEffect(() => {
-    load().catch(console.error);
+    load().catch((err) => {
+      console.error(err);
+      notify('Failed to load gallery photos.', true);
+    });
     (async () => {
-      const token = (await fetchAuthSession()).tokens?.idToken?.toString() ?? '';
+      const session = await fetchAuthSession();
+      const token = session.tokens?.idToken?.toString() ?? '';
+      const payload = session.tokens?.idToken?.payload;
       const res = await get({
         apiName: 'cloudgalleryRest',
         path: 'whoami',
         options: { headers: { Authorization: token } },
       }).response;
-      setMe((await res.body.json()) as Me);
+      const data = (await res.body.json()) as Me;
+      setMe({
+        ...data,
+        sub: typeof payload?.sub === 'string' ? payload.sub : undefined,
+        username:
+          typeof payload?.['cognito:username'] === 'string'
+            ? payload['cognito:username']
+            : undefined,
+      });
     })().catch(console.error);
-  }, [load]);
+  }, [load, notify]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open]);
 
   async function upload(files: FileList | null) {
     if (!files?.length) return;
+    const images = Array.from(files).filter((x) => x.type.startsWith('image/'));
+    if (!images.length) {
+      notify('Please select valid image files (JPG, PNG, WebP).', true);
+      return;
+    }
     setBusy(true);
     try {
       const { identityId } = await fetchAuthSession();
-      for (const f of Array.from(files).filter((x) => x.type.startsWith('image/'))) {
+      for (const f of images) {
         const path = `photos/${identityId}/${Date.now()}-${f.name}`;
         await uploadData({ path, data: f, options: { contentType: f.type } }).result;
-        await client.models.Photo.create({ title: f.name.replace(/\.[^.]+$/, ''), s3Key: path });
+        await client.models.Photo.create({
+          title: f.name.replace(/\.[^.]+$/, ''),
+          s3Key: path,
+        });
       }
       await load();
+      notify(`Uploaded ${images.length} ${images.length === 1 ? 'photo' : 'photos'} to S3.`);
+    } catch (err) {
+      console.error(err);
+      notify('Upload failed. Check console for details.', true);
     } finally {
       setBusy(false);
     }
   }
 
   async function del(p: Photo) {
-    await remove({ path: p.s3Key });
-    await client.models.Photo.delete({ id: p.id });
-    setOpen(null);
-    await load();
+    if (deletingId) return;
+    setDeletingId(p.id);
+    try {
+      await remove({ path: p.s3Key });
+      await client.models.Photo.delete({ id: p.id });
+      if (open?.id === p.id) setOpen(null);
+      await load();
+      notify(`Deleted "${p.title}".`);
+    } catch (err) {
+      console.error(err);
+      notify('Could not delete photo.', true);
+    } finally {
+      setDeletingId(null);
+    }
   }
 
-  const mine = photos.filter((p) => p.owner?.startsWith(uid)).length;
-  const canDelete = (p: Photo) => isAdmin || p.owner?.startsWith(uid);
+  const mineCount = useMemo(() => photos.filter((p) => isMine(p)).length, [photos, isMine]);
+
+  const visiblePhotos = useMemo(() => {
+    return photos.filter((p) => {
+      if (filter === 'mine' && !isMine(p)) return false;
+      if (query.trim() && !p.title.toLowerCase().includes(query.trim().toLowerCase())) {
+        return false;
+      }
+      return true;
+    });
+  }, [photos, filter, isMine, query]);
 
   return (
     <>
@@ -110,28 +227,46 @@ function Dashboard({ uid }: { uid: string }) {
           <span className="dot" /> CloudGallery
         </div>
         <div className="who">
-          <span className={`badge ${isAdmin ? 'admin' : ''}`}>{me.groups?.[0] ?? '…'}</span>
-          <span className="mail">{me.email}</span>
+          <span className={`badge ${isAdmin ? 'admin' : ''}`}>{displayRole}</span>
+          {me.email && <span className="mail">{me.email}</span>}
           <button className="btn ghost" onClick={() => signOut()}>
             Sign out
           </button>
         </div>
       </nav>
+
       <main>
         <section className="stats">
-          <div>
+          <div className="stat-card">
+            <div className="stat-label">
+              <span>Photos in gallery</span>
+              <span>S3 + AppSync</span>
+            </div>
             <b>{photos.length}</b>
-            <span>Photos in gallery</span>
+            <span className="stat-sub">Shared across authenticated members</span>
           </div>
-          <div>
-            <b>{mine}</b>
-            <span>Uploaded by you</span>
+
+          <div className="stat-card">
+            <div className="stat-label">
+              <span>Uploaded by you</span>
+              <span>Owner Scope</span>
+            </div>
+            <b>{mineCount}</b>
+            <span className="stat-sub">Full write &amp; delete permissions</span>
           </div>
-          <div>
+
+          <div className="stat-card">
+            <div className="stat-label">
+              <span>Your role</span>
+              <span>Cognito RBAC</span>
+            </div>
             <b>{isAdmin ? 'Admin' : 'Member'}</b>
-            <span>Your role</span>
+            <span className="stat-sub">
+              {isAdmin ? 'Can moderate & delete all uploads' : 'Can view all & manage own uploads'}
+            </span>
           </div>
         </section>
+
         <label
           className={`drop ${drag ? 'on' : ''}`}
           onDragOver={(e) => {
@@ -150,34 +285,106 @@ function Dashboard({ uid }: { uid: string }) {
             accept="image/*"
             multiple
             hidden
-            onChange={(e) => upload(e.target.files)}
+            disabled={busy}
+            onChange={(e) => {
+              upload(e.target.files);
+              e.target.value = '';
+            }}
           />
           <div className="plus">{busy ? <i className="spin" /> : '+'}</div>
-          <strong>{busy ? 'Uploading…' : 'Drop pictures here or click to browse'}</strong>
-          <small>JPG, PNG, WebP · stored securely in Amazon S3</small>
+          <strong>{busy ? 'Uploading to Amazon S3...' : 'Drop pictures here or click to browse'}</strong>
+          <small>JPG, PNG, WebP &middot; Encrypted in Amazon S3 with DynamoDB metadata</small>
         </label>
-        {photos.length === 0 ? (
-          <p className="empty">No photos yet. Be the first to upload.</p>
+
+        <div className="toolbar">
+          <div className="tabs">
+            <button
+              type="button"
+              className={`tab ${filter === 'all' ? 'active' : ''}`}
+              onClick={() => setFilter('all')}
+            >
+              All Photos <span className="tab-count">{photos.length}</span>
+            </button>
+            <button
+              type="button"
+              className={`tab ${filter === 'mine' ? 'active' : ''}`}
+              onClick={() => setFilter('mine')}
+            >
+              My Uploads <span className="tab-count">{mineCount}</span>
+            </button>
+          </div>
+
+          <div className="search-box">
+            <input
+              type="search"
+              placeholder="Search photos by title..."
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {visiblePhotos.length === 0 ? (
+          <div className="empty">
+            {photos.length === 0
+              ? 'No photos yet. Drop an image above to be the first to upload.'
+              : 'No photos match your current filter.'}
+          </div>
         ) : (
           <section className="grid">
-            {photos.map((p) => (
-              <figure key={p.id} onClick={() => setOpen(p)}>
-                <img src={p.url} alt={p.title} loading="lazy" />
-                <figcaption>{p.title}</figcaption>
-              </figure>
-            ))}
+            {visiblePhotos.map((p) => {
+              const owned = isMine(p);
+              const deletable = canDelete(p);
+              return (
+                <figure key={p.id} onClick={() => setOpen(p)}>
+                  <div className="card-top">
+                    {owned ? <span className="owner-tag">Yours</span> : <span />}
+                    {deletable && (
+                      <button
+                        type="button"
+                        className="card-del"
+                        title="Delete photo"
+                        disabled={deletingId === p.id}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          del(p);
+                        }}
+                      >
+                        {deletingId === p.id ? '...' : '✕'}
+                      </button>
+                    )}
+                  </div>
+                  <img src={p.url} alt={p.title} loading="lazy" />
+                  <figcaption>
+                    <span className="cap-title">{p.title}</span>
+                    <span className="cap-date">{formatDate(p.createdAt)}</span>
+                  </figcaption>
+                </figure>
+              );
+            })}
           </section>
         )}
       </main>
+
       {open && (
         <div className="lightbox" onClick={() => setOpen(null)}>
-          <div onClick={(e) => e.stopPropagation()}>
+          <div className="lightbox-box" onClick={(e) => e.stopPropagation()}>
             <img src={open.url} alt={open.title} />
             <div className="bar">
-              <strong>{open.title}</strong>
+              <div className="bar-meta">
+                <strong>{open.title}</strong>
+                <span>
+                  Uploaded {formatDate(open.createdAt)}
+                  {isMine(open) ? ' · Uploaded by you' : ''}
+                </span>
+              </div>
               {canDelete(open) && (
-                <button className="btn danger" onClick={() => del(open)}>
-                  Delete
+                <button
+                  className="btn danger"
+                  disabled={deletingId === open.id}
+                  onClick={() => del(open)}
+                >
+                  {deletingId === open.id ? 'Deleting...' : 'Delete Photo'}
                 </button>
               )}
               <button className="btn ghost" onClick={() => setOpen(null)}>
@@ -187,28 +394,34 @@ function Dashboard({ uid }: { uid: string }) {
           </div>
         </div>
       )}
+
+      {toast && <div className={`toast ${toast.err ? 'err' : ''}`}>{toast.text}</div>}
     </>
   );
 }
 
 export default function App() {
-  const [uid, setUid] = useState<string | null | undefined>(undefined);
+  const [user, setUser] = useState<AuthUser | null | undefined>(undefined);
+
   useEffect(() => {
     const check = () =>
       getCurrentUser()
-        .then((u) => setUid(u.userId))
-        .catch(() => setUid(null));
+        .then((u) => setUser({ userId: u.userId, username: u.username }))
+        .catch(() => setUser(null));
     check();
     return Hub.listen('auth', ({ payload }) => {
-      if (payload.event === 'signedOut') setUid(null);
+      if (payload.event === 'signedOut') setUser(null);
       else if (payload.event === 'signedIn' || payload.event === 'signInWithRedirect') check();
     });
   }, []);
-  if (uid === undefined)
+
+  if (user === undefined) {
     return (
       <div className="center">
         <i className="spin" />
       </div>
     );
-  return uid ? <Dashboard uid={uid} /> : <Landing />;
+  }
+
+  return user ? <Dashboard user={user} /> : <Landing />;
 }
