@@ -33,8 +33,8 @@ function Landing() {
         <span className="grad">beautifully shared.</span>
       </h1>
       <p>
-        A private-by-default cloud photo gallery powered by Amazon Cognito, S3, and AppSync. Sign
-        in once, upload in seconds, and manage your collection anywhere.
+        A private-by-default cloud photo gallery powered by Amazon Cognito, S3, and AppSync. Sign in
+        once, upload in seconds, and manage your collection anywhere.
       </p>
       <button className="btn big" onClick={() => signInWithRedirect({ provider: 'Google' })}>
         <svg width="19" height="19" viewBox="0 0 48 48">
@@ -101,9 +101,7 @@ function Dashboard({ user }: { user: AuthUser }) {
   }, [isAdmin, me.groups]);
 
   const ownerIds = useMemo(() => {
-    return [user.userId, user.username, me.sub, me.username].filter(
-      (v): v is string => Boolean(v),
-    );
+    return [user.userId, user.username, me.sub, me.username].filter((v): v is string => Boolean(v));
   }, [user.userId, user.username, me.sub, me.username]);
 
   const isMine = useCallback(
@@ -292,7 +290,9 @@ function Dashboard({ user }: { user: AuthUser }) {
             }}
           />
           <div className="plus">{busy ? <i className="spin" /> : '+'}</div>
-          <strong>{busy ? 'Uploading to Amazon S3...' : 'Drop pictures here or click to browse'}</strong>
+          <strong>
+            {busy ? 'Uploading to Amazon S3...' : 'Drop pictures here or click to browse'}
+          </strong>
           <small>JPG, PNG, WebP &middot; Encrypted in Amazon S3 with DynamoDB metadata</small>
         </label>
 
